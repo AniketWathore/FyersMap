@@ -1,0 +1,7 @@
+# Bookmap Terminal — Python Dependencies
+# Install with: pip install -r requirements.txt
+
+PyQt5>=5.15.0
+pyqtgraph>=0.13.0
+numpy>=1.21.0
+pandas>=1.3.0
