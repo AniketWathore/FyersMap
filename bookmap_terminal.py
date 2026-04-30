@@ -70,7 +70,7 @@ ORDERBOOK_FILE = (
 # ─────────────────────────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────────────────────────
-PRICE_LEVELS     = 50        # rows per side
+SNAPSHOT_LEVELS  = 50        # source depth per side in each incoming snapshot
 ROW_H            = 19        # DOM row height (px)
 OB_CHUNK_SIZE    = 10_000    # OB CSV read chunk
 DOM_UPDATE_EVERY = 2         # throttle DOM redraws
@@ -191,7 +191,15 @@ class OrderbookTracker:
 
     def update(self, snap: pd.DataFrame, mid: float) -> Dict:
         if snap.empty:
-            return {'bids': [], 'asks': [], 'mid': mid}
+            return {
+                'bids': [(lv.price, lv.cumulative_qty, lv.cumulative_orders)
+                         for lv in sorted(self.bid_levels.values(),
+                                          key=lambda x: x.price, reverse=True)],
+                'asks': [(lv.price, lv.cumulative_qty, lv.cumulative_orders)
+                         for lv in sorted(self.ask_levels.values(),
+                                          key=lambda x: x.price, reverse=False)],
+                'mid': mid,
+            }
 
         prices   = snap['price'].values.astype(np.float64)
         bid_qtys = snap['bid_qty'].values.astype(np.int32)
@@ -203,34 +211,28 @@ class OrderbookTracker:
                     if 'ask_orders' in snap.columns
                     else np.zeros(len(snap), np.int32))
 
-        cur_b: set = set()
-        cur_a: set = set()
         for i in range(len(prices)):
             p = round(float(prices[i]), 2)
             bq, aq = int(bid_qtys[i]), int(ask_qtys[i])
             bo, ao = int(bid_ords[i]),  int(ask_ords[i])
             if bq > 0:
-                cur_b.add(p)
                 if p not in self.bid_levels:
                     self.bid_levels[p] = PriceLevelData(p, 'bid')
                 self.bid_levels[p].update(bq, bo)
             if aq > 0:
-                cur_a.add(p)
                 if p not in self.ask_levels:
                     self.ask_levels[p] = PriceLevelData(p, 'ask')
                 self.ask_levels[p].update(aq, ao)
 
-        # bids: HIGH→LOW (nearest mid first)
+        # Keep all observed levels so the DOM ladder remains stable across ticks.
         active_bids = sorted(
-            (lv for lv in self.bid_levels.values() if lv.price in cur_b),
+            self.bid_levels.values(),
             key=lambda x: x.price, reverse=True,
-        )[:PRICE_LEVELS]
-
-        # asks: LOW→HIGH (nearest mid first)
+        )
         active_asks = sorted(
-            (lv for lv in self.ask_levels.values() if lv.price in cur_a),
+            self.ask_levels.values(),
             key=lambda x: x.price, reverse=False,
-        )[:PRICE_LEVELS]
+        )
 
         return {
             'bids': [(lv.price, lv.cumulative_qty, lv.cumulative_orders)
@@ -315,31 +317,13 @@ class BarDelegate(QStyledItemDelegate):
 # ═════════════════════════════════════════════════════════════
 class OrderbookWidget(QFrame):
     """
-    Rolling window: shows 51 price levels (25 bids + mid + 25 asks) centered on mid price.
-    Automatically adjusts as mid price moves through price levels.
-    
-    Display (top → bottom):
-    ┌ BIDs header │ All Bid Quantity │ All Bid Orders ┐
-    │ row  0: BID  25 levels up (farthest from mid)  │
-    │ …                                               │
-    │ row 24: HIGHEST BID (nearest mid)               │
-    │ row 25: ─── MID PRICE ₹xxxx.xx ───  (3-col span)│
-    │ row 26: LOWEST ASK (nearest mid)                │
-    │ …                                               │
-    │ row 50: ASK  25 levels down (farthest from mid) │
-    └ ASKs footer │ All Ask Quantity │ All Ask Orders ┘
-    
-    Rolling behavior:
-    - Shows nearest 25 bids (bids[0:25]) and nearest 25 asks (asks[0:25])
-    - As orderbook updates with new prices, different levels enter/leave top 25
-    - Mid price stays at row 25, with 25 levels above and below
-    - Window automatically "rolls" as mid price moves and new orders flow
+    Scrollable full ladder:
+    - Keeps every observed bid/ask price level in a persistent ladder.
+    - Price rows stay fixed by absolute price (no row re-use for different prices).
+    - Mid row is inserted at the current mid-price position and moves as price moves.
+    - Initial viewport is centred near mid with ~21 levels above/below when possible.
     """
-    DISPLAY_LEVELS = 51       # Show 51 rows total (25 bids + mid + 25 asks)
-    DISPLAY_BIDS = 25         # Show 25 bid levels
-    DISPLAY_ASKS = 25         # Show 25 ask levels
-    MID_ROW = DISPLAY_LEVELS // 2  # Row 25 (0-indexed)
-    TOTAL_ROWS = DISPLAY_LEVELS
+    INITIAL_VISIBLE_LEVELS_PER_SIDE = 21
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -351,10 +335,12 @@ class OrderbookWidget(QFrame):
         self._tick_ctr   = 0
         self._centred    = False
         self._last_mid_price = 0.0
-        self._all_bids = []  # Top 50 bids from tracker, sorted HIGH→LOW
-        self._all_asks = []  # Top 50 asks from tracker, sorted LOW→HIGH
-        self._current_display_bids = []  # Currently displayed 25 bids
-        self._current_display_asks = []  # Currently displayed 25 asks
+        self._all_prices: List[float] = []          # Persistent ladder, DESC
+        self._price_side: Dict[float, str] = {}     # First observed side for style fallback
+        self._bid_map: Dict[float, Tuple[int, int]] = {}
+        self._ask_map: Dict[float, Tuple[int, int]] = {}
+        self._render_rows: List[Tuple[str, Optional[float]]] = []
+        self._mid_row_index = 0
         self._build()
 
     def _build(self):
@@ -366,7 +352,7 @@ class OrderbookWidget(QFrame):
             [("BIDs", 1), ("All Bid Quantity", 2), ("All Bid Orders", 2)], C_BID
         ))
 
-        self.tbl = QTableWidget(self.TOTAL_ROWS, 3)
+        self.tbl = QTableWidget(1, 3)
         self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tbl.setSelectionMode(QAbstractItemView.NoSelection)
         self.tbl.setFocusPolicy(Qt.NoFocus)
@@ -390,24 +376,19 @@ class OrderbookWidget(QFrame):
         self.tbl.setColumnWidth(0, 75)
         for c in (1, 2):
             self.tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.Stretch)
-        for r in range(self.TOTAL_ROWS):
+        for r in range(1):
             self.tbl.setRowHeight(r, ROW_H)
 
         self.tbl.setItemDelegateForColumn(0, PriceDelegate(self.tbl))
         self.tbl.setItemDelegateForColumn(1, BarDelegate(self.tbl))
         self.tbl.setItemDelegateForColumn(2, BarDelegate(self.tbl))
 
-        for r in range(self.TOTAL_ROWS):
+        for r in range(1):
             for c in range(3):
                 it = QTableWidgetItem('')
                 it.setData(Qt.UserRole,     'empty')
                 it.setData(Qt.UserRole + 1, 0.0)
                 self.tbl.setItem(r, c, it)
-
-        self.tbl.setSpan(self.MID_ROW, 0, 1, 3)
-        mi = self.tbl.item(self.MID_ROW, 0)
-        mi.setData(Qt.UserRole,    'mid')
-        mi.setData(Qt.DisplayRole, '── MID PRICE ──')
 
         root.addWidget(self.tbl, stretch=1)
         root.addWidget(self._hdr(
@@ -454,6 +435,52 @@ class OrderbookWidget(QFrame):
         for c in range(3):
             self._cell(r, c, 'empty', 0.0, '')
 
+    def _ensure_rows(self, n_rows: int):
+        cur = self.tbl.rowCount()
+        if cur < n_rows:
+            self.tbl.setRowCount(n_rows)
+            for r in range(cur, n_rows):
+                self.tbl.setRowHeight(r, ROW_H)
+                for c in range(3):
+                    it = QTableWidgetItem('')
+                    it.setData(Qt.UserRole, 'empty')
+                    it.setData(Qt.UserRole + 1, 0.0)
+                    self.tbl.setItem(r, c, it)
+        elif cur > n_rows:
+            self.tbl.setRowCount(n_rows)
+
+    def _set_mid_row(self, row: int, mid: float):
+        self.tbl.clearSpans()
+        self.tbl.setSpan(row, 0, 1, 3)
+        self._cell(row, 1, 'empty', 0.0, '')
+        self._cell(row, 2, 'empty', 0.0, '')
+        mi = self.tbl.item(row, 0)
+        if mi:
+            mi.setData(Qt.UserRole, 'mid')
+            mi.setData(Qt.DisplayRole, f'── MID PRICE  ₹{mid:.2f} ──')
+
+    def _mid_insert_index(self, mid: float) -> int:
+        # Ladder sorted DESC: first index where price < mid.
+        for i, price in enumerate(self._all_prices):
+            if price < mid:
+                return i
+        return len(self._all_prices)
+
+    def _scroll_mid_into_view(self, force_center: bool = False):
+        sb = self.tbl.verticalScrollBar()
+        vh = self.tbl.viewport().height()
+        if vh <= 0:
+            return
+        visible_rows = max(1, vh // ROW_H)
+        top = sb.value() // ROW_H
+        bottom = top + visible_rows - 1
+        target_top = max(0, self._mid_row_index - self.INITIAL_VISIBLE_LEVELS_PER_SIDE)
+        row_margin = 2
+        if force_center or self._mid_row_index < (top + row_margin) or self._mid_row_index > (bottom - row_margin):
+            max_top = max(0, self.tbl.rowCount() - visible_rows)
+            target_top = max(0, min(target_top, max_top))
+            sb.setValue(target_top * ROW_H)
+
     # ── Refresh ─────────────────────────────────────────────────────────────
     def refresh(self, ob: Dict, bid: float, ask: float, mid: float):
         self._tick_ctr += 1
@@ -462,127 +489,121 @@ class OrderbookWidget(QFrame):
 
         bids: List = ob.get('bids', [])   # HIGH→LOW  (index 0 = nearest mid)
         asks: List = ob.get('asks', [])   # LOW→HIGH   (index 0 = nearest mid)
-        
-        # Store all bids/asks for rolling window calculation
-        self._all_bids = bids  # Top 50 bids from tracker
-        self._all_asks = asks  # Top 50 asks from tracker
         self._last_mid_price = mid
 
+        self._bid_map = {round(float(p), 2): (int(q), int(o)) for p, q, o in bids}
+        self._ask_map = {round(float(p), 2): (int(q), int(o)) for p, q, o in asks}
+
+        new_prices = set(self._all_prices)
+        for p in self._bid_map:
+            if p not in self._price_side:
+                self._price_side[p] = 'bid'
+            new_prices.add(p)
+        for p in self._ask_map:
+            if p not in self._price_side:
+                self._price_side[p] = 'ask'
+            new_prices.add(p)
+        self._all_prices = sorted(new_prices, reverse=True)
+
         # Calculate max quantities for intensity bars
-        all_q = [q for _, q, _ in bids + asks]
-        all_o = [o for _, _, o in bids + asks]
+        all_q = [q for q, _ in self._bid_map.values()] + [q for q, _ in self._ask_map.values()]
+        all_o = [o for _, o in self._bid_map.values()] + [o for _, o in self._ask_map.values()]
         if all_q: self._max_qty    = max(self._max_qty    * 0.96, max(all_q))
         if all_o: self._max_orders = max(self._max_orders * 0.96, max(all_o))
         mq, mo = max(self._max_qty, 1), max(self._max_orders, 1)
 
-        # ─────────────────────────────────────────────────────────────────
-        # ROLLING WINDOW: Show 51 levels centered on mid price (25+mid+25)
-        # Rolling behavior: Display nearest 25 bids and 25 asks to current mid
-        # As orderbook updates, different prices enter/leave the top 25
-        # ─────────────────────────────────────────────────────────────────
-        
-        # Take 25 nearest bids (highest bids) and 25 nearest asks (lowest asks)
-        # These are closest to mid price, creating a window around it
-        display_bids = bids[:self.DISPLAY_BIDS] if len(bids) >= self.DISPLAY_BIDS else bids[:]
-        display_asks = asks[:self.DISPLAY_ASKS] if len(asks) >= self.DISPLAY_ASKS else asks[:]
-        
-        # Pad with None if not enough levels available
-        while len(display_bids) < self.DISPLAY_BIDS:
-            display_bids = [None] + display_bids  # Add to the top (farthest from mid)
-        while len(display_asks) < self.DISPLAY_ASKS:
-            display_asks.append(None)  # Add to the bottom (farthest from mid)
-        
-        # Store current display for reference
-        self._current_display_bids = display_bids[:]
-        self._current_display_asks = display_asks[:]
-        
-        # Display rows 0-24: BIDs (reversed so farthest/oldest is at top)
-        display_bids_rev = list(reversed(display_bids))
-        for r in range(self.DISPLAY_BIDS):
-            item = display_bids_rev[r]
-            if item is None:
-                self._empty(r)
-            else:
-                price, qty, orders = item
-                self._row(r, 'bid', f'{price:.2f}',
-                          qty,    min(1.0, qty    / mq),
-                          orders, min(1.0, orders / mo))
+        # Build render rows as persistent ladder prices + moving mid row.
+        insert_at = self._mid_insert_index(mid)
+        render_rows: List[Tuple[str, Optional[float]]] = []
+        for i, price in enumerate(self._all_prices):
+            if i == insert_at:
+                render_rows.append(('mid', None))
+            render_rows.append(('price', price))
+        if insert_at == len(self._all_prices):
+            render_rows.append(('mid', None))
 
-        # MID ROW at row 25 - always shows current mid price
-        mi = self.tbl.item(self.MID_ROW, 0)
-        if mi:
-            mi.setData(Qt.DisplayRole, f'── MID PRICE  ₹{mid:.2f} ──')
+        self._render_rows = render_rows
+        self._mid_row_index = next((i for i, (t, _) in enumerate(render_rows) if t == 'mid'), 0)
+        self._ensure_rows(len(render_rows))
 
-        # Display rows 26-50: ASKs (nearest to farthest)
-        for i in range(self.DISPLAY_ASKS):
-            r = self.MID_ROW + 1 + i
-            item = display_asks[i]
-            if item is None:
-                self._empty(r)
+        for r, (row_type, price) in enumerate(render_rows):
+            if row_type == 'mid':
+                self._set_mid_row(r, mid)
+                continue
+
+            bid_data = self._bid_map.get(price)
+            ask_data = self._ask_map.get(price)
+
+            if bid_data and ask_data:
+                rt = 'bid' if price <= mid else 'ask'
+                qty, orders = bid_data if rt == 'bid' else ask_data
+            elif bid_data:
+                rt = 'bid'
+                qty, orders = bid_data
+            elif ask_data:
+                rt = 'ask'
+                qty, orders = ask_data
             else:
-                price, qty, orders = item
-                self._row(r, 'ask', f'{price:.2f}',
-                          qty,    min(1.0, qty    / mq),
+                rt = self._price_side.get(price, 'empty')
+                qty, orders = 0, 0
+
+            if rt in ('bid', 'ask'):
+                self._row(r, rt, f'{price:.2f}',
+                          qty,    min(1.0, qty / mq),
                           orders, min(1.0, orders / mo))
+            else:
+                self._empty(r)
 
         self.tbl.viewport().update()
 
-        # Center the view on mid row on first display
+        # Center initial view around mid; afterwards keep mid row in view.
         if not self._centred:
             self._centred = True
-            QTimer.singleShot(120, self._centre)
+            QTimer.singleShot(120, lambda: self._scroll_mid_into_view(force_center=True))
+        else:
+            self._scroll_mid_into_view(force_center=False)
 
         # Update footer statistics
-        tb = int(sum(q for _, q, _ in bids))
-        ta = int(sum(q for _, q, _ in asks))
+        tb = int(sum(q for q, _ in self._bid_map.values()))
+        ta = int(sum(q for q, _ in self._ask_map.values()))
         self.stat.setText(
-            f"  BID Qty: {tb:>10,}  │  ASK Qty: {ta:>10,}  │  LEVELS: {len(bids)}/{len(asks)}"
+            f"  BID Qty: {tb:>10,}  │  ASK Qty: {ta:>10,}  │  LEVELS: {len(self._bid_map)}/{len(self._ask_map)}"
         )
 
     def get_visible_price_range(self) -> Tuple[float, float]:
         """
-        Get the highest visible bid and lowest visible ask prices.
+        Get top/bottom visible ladder prices for chart Y-range sync.
         Used to align chart Y-axis with orderbook display.
-        Returns: (highest_visible_bid, lowest_visible_ask)
+        Returns: (highest_visible_price, lowest_visible_price)
         """
-        if not self._current_display_bids or not self._current_display_asks:
+        if not self._render_rows:
             return 0.0, 0.0
-        
-        # Find highest bid (last in reversed list = first in original)
-        highest_bid = 0.0
-        for item in self._current_display_bids:
-            if item is not None:
-                price, _, _ = item
-                highest_bid = max(highest_bid, price)
-        
-        # Find lowest ask (first in list since sorted ascending)
-        lowest_ask = float('inf')
-        for item in self._current_display_asks:
-            if item is not None:
-                price, _, _ = item
-                lowest_ask = min(lowest_ask, price)
-        
-        # Return valid range or defaults
-        if lowest_ask == float('inf'):
-            lowest_ask = self._last_mid_price + 0.5
-        if highest_bid == 0:
-            highest_bid = self._last_mid_price - 0.5
-        
-        return highest_bid, lowest_ask
 
-    def _centre(self):
-        tgt = max(0, self.MID_ROW * ROW_H - self.tbl.viewport().height() // 2)
-        self.tbl.verticalScrollBar().setValue(tgt)
+        sb_val = self.tbl.verticalScrollBar().value()
+        vh = max(1, self.tbl.viewport().height())
+        top_row = max(0, sb_val // ROW_H)
+        bottom_row = min(len(self._render_rows) - 1, (sb_val + vh - 1) // ROW_H)
+
+        visible_prices = [
+            price for row_type, price in self._render_rows[top_row:bottom_row + 1]
+            if row_type == 'price' and price is not None
+        ]
+        if not visible_prices:
+            return self._last_mid_price + 0.5, self._last_mid_price - 0.5
+        return max(visible_prices), min(visible_prices)
 
     def reset(self):
         self._tick_ctr = 0
         self._centred  = False
-        for r in range(self.TOTAL_ROWS):
-            if r == self.MID_ROW:
-                mi = self.tbl.item(r, 0)
-                if mi: mi.setData(Qt.DisplayRole, '── MID PRICE ──')
-                continue
-            self._empty(r)
+        self._last_mid_price = 0.0
+        self._all_prices.clear()
+        self._price_side.clear()
+        self._bid_map.clear()
+        self._ask_map.clear()
+        self._render_rows = [('mid', None)]
+        self._mid_row_index = 0
+        self._ensure_rows(1)
+        self._set_mid_row(0, 0.0)
         self.stat.setText('')
         self.tbl.viewport().update()
 
@@ -803,29 +824,24 @@ class TradingChart(pg.GraphicsLayoutWidget):
             pad = max(hi - lo, 0.5) * 0.12
             self.plt.setYRange(lo - pad, hi + pad, padding=0)
 
-    def sync_y_range_with_orderbook(self, visible_bid_high: float, visible_ask_low: float):
+    def sync_y_range_with_orderbook(self, visible_price_high: float, visible_price_low: float):
         """
         Align chart Y-axis range with orderbook's visible price range.
         This ensures the mid-price dotted line appears at the same visual height
         as the orderbook's mid-price row.
         
         Args:
-            visible_bid_high: Highest visible bid price in orderbook
-            visible_ask_low:  Lowest visible ask price in orderbook
+            visible_price_high: Highest visible price in orderbook viewport
+            visible_price_low:  Lowest visible price in orderbook viewport
         """
-        if visible_bid_high > 0 and visible_ask_low > 0:
-            # Set Y-range to cover the visible orderbook price range with padding
-            price_span = visible_ask_low - visible_bid_high
-            if price_span < 0.1:
-                price_span = 1.0  # Minimum span for stability
-            
-            pad = price_span * 0.05  # 5% padding
-            y_low = visible_bid_high - pad
-            y_high = visible_ask_low + pad
-            
-            # Only update if not manually zoomed
+        if visible_price_high > 0 and visible_price_low > 0:
+            y_low = min(visible_price_high, visible_price_low)
+            y_high = max(visible_price_high, visible_price_low)
+            price_span = max(y_high - y_low, 0.1)
+            pad = price_span * 0.05
+
             if not self._user_zoomed:
-                self.plt.setYRange(y_low, y_high, padding=0)
+                self.plt.setYRange(y_low - pad, y_high + pad, padding=0)
 
     def _on_manual(self, *_):
         self._user_zoomed = True
