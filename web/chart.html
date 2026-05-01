@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { padding: 0; margin: 0; background: #07070e; overflow: hidden; }
+    #chart { width: 100vw; height: 100vh; }
+  </style>
+  <script src="./vendor/klinecharts.min.js"></script>
+</head>
+<body>
+  <div id="chart"></div>
+  <script>
+    let chart;
+    window.onload = function() {
+      // klinecharts globally loaded
+      chart = klinecharts.init('chart', {
+        styles: {
+          grid: { 
+              horizontal: { show: true, color: '#1a1a30', style: 'dashed', dashValue: [2, 2] },
+              vertical: { show: true, color: '#1a1a30', style: 'dashed', dashValue: [2, 2] }
+          },
+          candle: {
+            type: 'area', // single line as an area
+            area: {
+              lineSize: 2,
+              lineColor: '#9999dd', 
+              value: 'close',
+              backgroundColor: [{
+                offset: 0,
+                color: 'rgba(153, 153, 221, 0.4)'
+              }, {
+                offset: 1,
+                color: 'rgba(153, 153, 221, 0.05)'
+              }]
+            },
+            tooltip: {
+                showRule: 'always',
+                showType: 'standard',
+                custom: (data) => {
+                    return [{
+                        title: 'MID: ',
+                        value: data.current.close ? data.current.close.toFixed(2) : '--'
+                    }];
+                }
+            }
+          },
+          xAxis: {
+            show: true,
+            axisLine: { show: false },
+            tickLine: { show: false },
+            tickText: { color: '#505068', size: 10 }
+          },
+          yAxis: {
+            show: true,
+            position: 'right',
+            axisLine: { show: false },
+            tickLine: { show: false },
+            tickText: { color: '#b0b0cc', size: 11 },
+            type: 'normal'
+          },
+          crosshair: {
+            show: true,
+            horizontal: {
+              line: { style: 'dashed', dashValue: [4, 4], color: '#707070' },
+              text: { backgroundColor: '#202040', color: '#ffffff' }
+            },
+            vertical: {
+              line: { style: 'dashed', dashValue: [4, 4], color: '#707070' },
+              text: { backgroundColor: '#202040', color: '#ffffff' }
+            }
+          }
+        }
+      });
+    };
+    
+    // update data incrementally
+    function updateTick(ts, price) {
+        if(!chart) return;
+        const kline = {
+            timestamp: ts * 1000, 
+            open: price,
+            close: price,
+            high: price,
+            low: price,
+            volume: 0,
+            turnover: 0
+        };
+        chart.updateData(kline);
+    }
+    
+    function resetChart() {
+        if(chart) {
+            chart.applyNewData([]);
+        }
+    }
+  </script>
+</body>
+</html>

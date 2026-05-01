@@ -394,8 +394,7 @@ class OrderbookWidget(QFrame):
         it.setData(Qt.UserRole + 1, float(iv))
         it.setData(Qt.DisplayRole,  txt)
 
-    def _row(self, r, rt, price_str, qty, qi, orders, oi):
-        self._cell(r, 0, rt, 0.0, price_str)
+def _row(self, r, rt, price_str, qty, qi, orders, oi):
         self._cell(r, 1, rt, qi,  f'{qty:,}'    if qty    else '')
         self._cell(r, 2, rt, oi,  f'{orders:,}' if orders else '')
 
@@ -434,9 +433,9 @@ class OrderbookWidget(QFrame):
 
         # fill bid rows (lowest price at row 0, highest just above MID)
         for i, (price, qty, orders) in enumerate(bids_asc):
-            self._row(i, 'bid', f'{price:.2f}',
-                      qty,    min(1.0, qty    / mq),
-                      orders, min(1.0, orders / mo))
+self._row(i, 'bid', f'{price:.2f}',
+                  qty,    min(1.0, qty    / mq),
+                  orders, min(1.0, orders / mo))
 
         # MID row
         mi = self.tbl.item(self._mid_idx, 0)
@@ -449,9 +448,9 @@ class OrderbookWidget(QFrame):
         # fill ask rows (lowest price just below MID, highest at bottom)
         for i, (price, qty, orders) in enumerate(asks_asc):
             r = self._mid_idx + 1 + i
-            self._row(r, 'ask', f'{price:.2f}',
-                      qty,    min(1.0, qty    / mq),
-                      orders, min(1.0, orders / mo))
+self._row(r, 'ask', f'{price:.2f}',
+                  qty,    min(1.0, qty    / mq),
+                  orders, min(1.0, orders / mo))
 
         self.tbl.viewport().update()
 
