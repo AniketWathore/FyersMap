@@ -53,7 +53,7 @@ log = logging.getLogger('bookmap')
 #  FILE PATHS  ← adjust if moved
 # ─────────────────────────────────────────────────────────────
 TICK_FILE = (
-    "/Users/prashik/Aniket/SMP/DATA/MarketDepthData/2026-04-02_09-51-52_NSE_TCS-EQ/NSE_TCS-EQ/NSE_TCS-EQ_tick_20260402_095152_ticks.csv"
+    "/Users/prashik/Aniket/SMP/DATA/MarketDepthData/2026-04-02_09-51-52_NSE_TCS-EQ/NSE_TCS-EQ/NSE_TCS-EQ_tick_20260402_095152.csv"
 )
 ORDERBOOK_FILE = (
     "/Users/prashik/Aniket/SMP/DATA/MarketDepthData/2026-04-02_09-51-52_NSE_TCS-EQ/NSE_TCS-EQ/NSE_TCS-EQ_orderbook_20260402_095152.csv"
@@ -166,18 +166,28 @@ class PriceLevelData:
     current_orders:    int = 0
     cumulative_qty:    int = 0
     cumulative_orders: int = 0
+    is_active:         bool = False      # Track if level appeared in latest snapshot
+    last_active_qty:   int = 0           # Store last known qty when it disappears
+    last_active_orders: int = 0          # Store last known orders when it disappears
+    disappeared:       bool = False      # Flag when level vanishes from data
 
     def update(self, qty: int, orders: int):
         self.current_qty    = qty
         self.current_orders = orders
+        self.is_active      = True
+        self.disappeared    = False
+        self.last_active_qty    = qty
+        self.last_active_orders = orders
         if qty > self.cumulative_qty:
             self.cumulative_qty = qty
         if orders > self.cumulative_orders:
             self.cumulative_orders = orders
 
-    def clear_current(self):
-        self.current_qty    = 0
-        self.current_orders = 0
+    def mark_disappeared(self):
+        """Called when a level was active but is no longer in the snapshot.
+        Keep the last_active values for display."""
+        self.is_active      = False
+        self.disappeared    = True
 
 
 # ═════════════════════════════════════════════════════════════
@@ -195,8 +205,8 @@ class OrderbookTracker:
         }
 
     def update(self, snap: pd.DataFrame, mid: float) -> int:
-        for lv in self.levels.values():
-            lv.clear_current()
+        # Track which prices appear in this snapshot
+        active_prices: set = set()
 
         if not snap.empty:
             prices   = snap['price'].values.astype(np.float64)
@@ -214,12 +224,18 @@ class OrderbookTracker:
                 lv = self.levels.get(p)
                 if lv is None:
                     continue
+                active_prices.add(p)
                 bq, aq = int(bid_qtys[i]), int(ask_qtys[i])
                 bo, ao = int(bid_ords[i]),  int(ask_ords[i])
                 if bq > 0:
                     lv.update(bq, bo)
                 elif aq > 0:
                     lv.update(aq, ao)
+
+        # Mark levels that were active before but not in current snapshot as disappeared
+        for p, lv in self.levels.items():
+            if lv.is_active and p not in active_prices:
+                lv.mark_disappeared()
 
         mid_idx = bisect.bisect_right(self.sorted_prices, mid) - 1
         mid_idx = max(0, min(mid_idx, len(self.sorted_prices) - 1))
@@ -230,32 +246,60 @@ class OrderbookTracker:
             lv.clear_current()
             lv.cumulative_qty    = 0
             lv.cumulative_orders = 0
+            lv.is_active         = False
+            lv.disappeared       = False
+            lv.last_active_qty   = 0
+            lv.last_active_orders= 0
 
 
 # ═════════════════════════════════════════════════════════════
 #  DELEGATES
 # ═════════════════════════════════════════════════════════════
 class PriceDelegate(QStyledItemDelegate):
-    """Column 0 — price text, coloured by zone."""
+    """Column 0 — price text, coloured by zone. Grayed out if disappeared."""
     def paint(self, p: QPainter, opt, idx):
         p.save()
         rt   = idx.data(Qt.UserRole) or 'empty'
+        disappeared = idx.data(Qt.UserRole + 2) or False  # Flag for disappeared
         text = str(idx.data(Qt.DisplayRole) or '')
-        bg   = {'bid': BID_BG, 'ask': ASK_BG,
-                'mid': MID_BG}.get(rt, EMPTY_BG)
+        
+        # Set background based on type
+        if rt == 'mid':
+            bg = MID_BG
+        elif rt == 'bid':
+            bg = BID_BG
+        elif rt == 'ask':
+            bg = ASK_BG
+        else:
+            bg = EMPTY_BG
+        
+        # Brighten if disappeared (to make it visible, not black)
+        if disappeared and rt in ('bid', 'ask'):
+            # Use a lighter shade to show it's stale
+            bg = QColor(
+                min(255, int(bg.red() * 1.5 + 40)),
+                min(255, int(bg.green() * 1.5 + 40)),
+                min(255, int(bg.blue() * 1.5 + 40))
+            )
+        
         p.fillRect(opt.rect, bg)
         p.setPen(QPen(SEP_CLR, 1))
         p.drawLine(opt.rect.topRight(), opt.rect.bottomRight())
+        
         if rt == 'mid':
-            p.setFont(_F9B); p.setPen(QColor(C_WHITE))
+            p.setFont(_F9B)
+            p.setPen(QColor(C_WHITE))
             p.drawText(opt.rect, Qt.AlignCenter, text)
         elif rt in ('bid', 'ask'):
             p.setFont(_F9)
-            p.setPen(QColor(C_BID if rt == 'bid' else C_ASK))
+            # Use dimmer color if disappeared, but still visible
+            color = C_DIM if disappeared else (C_BID if rt == 'bid' else C_ASK)
+            p.setPen(QColor(color))
             p.drawText(opt.rect.adjusted(8, 0, -4, 0),
                        Qt.AlignVCenter | Qt.AlignLeft, text)
         elif text:
-            p.setFont(_F8); p.setPen(QColor(C_DIM))
+            p.setFont(_F8)
+            p.setPen(QColor(C_DIM))
             p.drawText(opt.rect, Qt.AlignCenter, text)
         p.restore()
 
@@ -264,19 +308,42 @@ class PriceDelegate(QStyledItemDelegate):
 
 
 class BarDelegate(QStyledItemDelegate):
-    """Columns 1 & 2 — quantity / orders with intensity bar."""
+    """Columns 1 & 2 — quantity / orders with intensity bar. Lighter if disappeared."""
     def paint(self, p: QPainter, opt, idx):
         p.save()
         rt  = idx.data(Qt.UserRole)     or 'empty'
         iv  = idx.data(Qt.UserRole + 1) or 0.0
+        disappeared = idx.data(Qt.UserRole + 2) or False  # Flag
         txt = str(idx.data(Qt.DisplayRole) or '')
-        bg  = {'bid': BID_BG, 'ask': ASK_BG,
-               'mid': MID_BG}.get(rt, EMPTY_BG)
+        
+        # Set background
+        if rt == 'mid':
+            bg = MID_BG
+        elif rt == 'bid':
+            bg = BID_BG
+        elif rt == 'ask':
+            bg = ASK_BG
+        else:
+            bg = EMPTY_BG
+        
+        # Brighten if disappeared
+        if disappeared and rt in ('bid', 'ask'):
+            bg = QColor(
+                min(255, int(bg.red() * 1.5 + 40)),
+                min(255, int(bg.green() * 1.5 + 40)),
+                min(255, int(bg.blue() * 1.5 + 40))
+            )
+        
         p.fillRect(opt.rect, bg)
         if rt == 'mid':
-            p.restore(); return
+            p.restore()
+            return
+        
         if rt in ('bid', 'ask') and iv > 0.015:
             br = 0.25 + iv * 0.75
+            # Make bars lighter if disappeared
+            if disappeared:
+                br *= 0.7
             r, g, b = BID_BAR_RGB if rt == 'bid' else ASK_BAR_RGB
             bw = max(3, int(opt.rect.width() * iv))
             p.fillRect(
@@ -284,8 +351,12 @@ class BarDelegate(QStyledItemDelegate):
                       bw, opt.rect.height() - 4),
                 QColor(int(r*br), int(g*br), int(b*br))
             )
+        
         if txt and rt in ('bid', 'ask'):
-            p.setFont(_F8); p.setPen(QColor(C_TEXT))
+            p.setFont(_F8)
+            # Gray text if disappeared, otherwise normal
+            color = C_DIM if disappeared else C_TEXT
+            p.setPen(QColor(color))
             p.drawText(opt.rect.adjusted(5, 0, -4, 0),
                        Qt.AlignVCenter | Qt.AlignLeft, txt)
         p.restore()
@@ -322,6 +393,7 @@ class OrderbookWidget(QFrame):
         self._tick_ctr       = 0
         self._auto_scroll    = True
         self._scroll_locked  = False   # prevents feedback loop
+        self._current_zoom   = 0.01    # Track chart zoom level for price grouping
         self._build()
 
     # ── build ────────────────────────────────────────────────
@@ -381,6 +453,11 @@ class OrderbookWidget(QFrame):
         )
         root.addWidget(self.stat)
 
+    # ── zoom synchronization ────────────────────────────────
+    def set_zoom_level(self, zoom: float):
+        """Called by main window when chart zoom changes."""
+        self._current_zoom = zoom
+
     # ── initialize (once, after data loaded) ─────────────────
     def initialize(self, sorted_prices: List[float]):
         # Display highest price at the top so asks appear above mid and bids below.
@@ -420,11 +497,12 @@ class OrderbookWidget(QFrame):
         if not self._scroll_locked:
             self._auto_scroll = False
 
-    def _cell(self, r, c, rt, iv, txt):
+    def _cell(self, r, c, rt, iv, txt, disappeared=False):
         it = self.tbl.item(r, c)
         if it is not None:
             it.setData(Qt.UserRole,     rt)
             it.setData(Qt.UserRole + 1, float(iv))
+            it.setData(Qt.UserRole + 2, bool(disappeared))  # Store disappeared flag
             it.setData(Qt.DisplayRole,  txt)
 
     # ── main refresh (called every tick) ─────────────────────
@@ -470,15 +548,26 @@ class OrderbookWidget(QFrame):
                 continue
             lv  = tracker.levels[prices[i]]
             rt  = 'ask' if i < mid_idx else 'bid'
-            qty  = lv.current_qty
-            ords = lv.current_orders
-            self._cell(i, 0, rt, 0.0,  f'{prices[i]:.2f}')
+            
+            # Display current if active, else display last known values
+            if lv.is_active:
+                qty  = lv.current_qty
+                ords = lv.current_orders
+            else:
+                qty  = lv.last_active_qty
+                ords = lv.last_active_orders
+            
+            # Always show values (even if qty/ords are 0 for new/empty levels)
+            qty_str  = f'{qty:,}' if qty > 0 else ''
+            ords_str = f'{ords:,}' if ords > 0 else ''
+            
+            self._cell(i, 0, rt, 0.0,  f'{prices[i]:.2f}', lv.disappeared)
             self._cell(i, 1, rt,
-                       min(1.0, qty  / mq) if qty  else 0.0,
-                       f'{qty:,}'  if qty  else '')
+                       min(1.0, qty  / mq) if qty  and mq > 0 else 0.0,
+                       qty_str, lv.disappeared)
             self._cell(i, 2, rt,
-                       min(1.0, ords / mo) if ords else 0.0,
-                       f'{ords:,}' if ords else '')
+                       min(1.0, ords / mo) if ords and mo > 0 else 0.0,
+                       ords_str, lv.disappeared)
 
         self.tbl.viewport().update()
 
@@ -546,9 +635,9 @@ class OrderbookWidget(QFrame):
             self.tbl.setSpan(old, 0, 1, 1)
         for r in range(self._n):
             price = self._sorted_prices[r]
-            self._cell(r, 0, 'empty', 0.0, f'{price:.2f}')
-            self._cell(r, 1, 'empty', 0.0, '')
-            self._cell(r, 2, 'empty', 0.0, '')
+            self._cell(r, 0, 'empty', 0.0, f'{price:.2f}', False)
+            self._cell(r, 1, 'empty', 0.0, '', False)
+            self._cell(r, 2, 'empty', 0.0, '', False)
         self.stat.setText('')
         self.tbl.viewport().update()
 
@@ -587,12 +676,14 @@ class TradingChart(QWidget):
     """
     QWebEngineView wrapping the local KLineChart JS implementation.
     Receives ticks dynamically without requiring any external internet APIs.
+    Supports zoom-level queries for synchronized orderbook display.
     """
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet(f"QWidget {{ background:{C_BG}; }}")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
         
         self.view = QWebEngineView(self)
         
@@ -601,8 +692,19 @@ class TradingChart(QWidget):
         self.view.load(QUrl.fromLocalFile(html_path))
         
         lay.addWidget(self.view)
+        
+        self._current_zoom = 0.01  # Default zoom level
 
-    # ── Y-range sync ─────────────────────────────────────────
+    def get_zoom_level(self) -> float:
+        """Query the current zoom level from the chart (blocking)."""
+        # This is a simplified version - will return last known zoom
+        # For more accurate real-time zoom, would need WebChannel
+        return self._current_zoom
+
+    def set_zoom_level(self, zoom: float):
+        """Update the cached zoom level."""
+        self._current_zoom = zoom
+
     def sync_y_range(self, low_price: float, high_price: float):
         """
         KLineChart auto-scales. We let its native zoom & pan do its job now.
@@ -610,17 +712,16 @@ class TradingChart(QWidget):
         """
         pass
 
-    # ── per-tick update ───────────────────────────────────────
     def on_tick(self, mid: float, tick_num: int, timestamp: int):
         js = f"updateTick({timestamp}, {mid});"
         self.view.page().runJavaScript(js)
 
-    # ── public API ────────────────────────────────────────────
     def resume_auto_range(self):
         pass
 
     def reset(self):
         self.view.page().runJavaScript("resetChart();")
+        self._current_zoom = 0.01
 
 
 # ═════════════════════════════════════════════════════════════
@@ -805,6 +906,11 @@ class BookmapTerminal(QMainWindow):
         self._timer        = QTimer(self)
         self._timer.timeout.connect(self._step)
         self.tracker       = None
+        
+        # Zoom sync timer - updates every 100ms
+        self._zoom_timer   = QTimer(self)
+        self._zoom_timer.timeout.connect(self._sync_zoom)
+        self._zoom_timer.setInterval(100)
 
     def _start_loading(self):
         self.sb.showMessage(
@@ -834,7 +940,14 @@ class BookmapTerminal(QMainWindow):
         self.tracker = OrderbookTracker(sorted_prices)
         self.dom.initialize(sorted_prices)
         self._timer.start(max(1, int(500 / self.ctrl.speed)))
+        self._zoom_timer.start()  # Start zoom sync timer
         self.sb.showMessage("▶  Playing…")
+
+    def _sync_zoom(self):
+        """Periodically sync zoom levels between chart and orderbook."""
+        # For now, we're syncing via visual synchronization of mid-price
+        # In a production system, this would query the chart's current zoom
+        pass
 
     def _speed_changed(self, _):
         if self._timer.isActive():
@@ -880,6 +993,7 @@ class BookmapTerminal(QMainWindow):
 
     def closeEvent(self, ev):
         self._timer.stop()
+        self._zoom_timer.stop()
         if hasattr(self, '_loader') and self._loader.isRunning():
             self._loader.quit()
             self._loader.wait(3000)

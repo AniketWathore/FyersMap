@@ -3,8 +3,9 @@
 <head>
   <meta charset="utf-8">
   <style>
-    body { padding: 0; margin: 0; background: #07070e; overflow: hidden; }
-    #chart { width: 100vw; height: 100vh; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; background: #07070e; overflow: hidden; }
+    #chart { width: 100%; height: 100%; display: block; }
   </style>
   <script src="./vendor/klinecharts.min.js"></script>
 </head>
@@ -12,6 +13,8 @@
   <div id="chart"></div>
   <script>
     let chart;
+    let currentZoomLevel = 0.01; // Track current price precision
+    
     window.onload = function() {
       // klinecharts globally loaded
       chart = klinecharts.init('chart', {
@@ -72,7 +75,49 @@
           }
         }
       });
+      
+      // Listen for zoom/scale changes
+      chart.subscribeAction('onZoom', function(params) {
+        updateZoomLevel();
+      });
+      
+      chart.subscribeAction('onScroll', function(params) {
+        updateZoomLevel();
+      });
     };
+    
+    function updateZoomLevel() {
+      if (!chart) return;
+      // Get the current visible price range
+      const bounding = chart.getConvertPictureCorner();
+      if (bounding && bounding.top !== undefined && bounding.bottom !== undefined) {
+        const priceRange = Math.abs(bounding.top - bounding.bottom);
+        
+        // Determine zoom level based on price range
+        if (priceRange < 0.5) {
+          currentZoomLevel = 0.01; // Fine: 0.01
+        } else if (priceRange < 1) {
+          currentZoomLevel = 0.05; // 0.05
+        } else if (priceRange < 2) {
+          currentZoomLevel = 0.1; // 0.1
+        } else if (priceRange < 5) {
+          currentZoomLevel = 0.5; // 0.5
+        } else if (priceRange < 10) {
+          currentZoomLevel = 1.0; // 1.0
+        } else if (priceRange < 20) {
+          currentZoomLevel = 3.0; // 3.0
+        } else if (priceRange < 50) {
+          currentZoomLevel = 5.0; // 5.0
+        } else {
+          currentZoomLevel = 10.0; // Coarse: 10+
+        }
+        
+        // Notify Python about zoom change
+        if (window.qt && window.qt.webChannelTransport) {
+          window.pyBridge.onZoomChanged(currentZoomLevel, bounding.top, bounding.bottom);
+        }
+      }
+    }
     
     // update data incrementally
     function updateTick(ts, price) {
@@ -92,7 +137,20 @@
     function resetChart() {
         if(chart) {
             chart.applyNewData([]);
+            currentZoomLevel = 0.01;
         }
+    }
+    
+    // Allow Python to get current zoom level
+    function getZoomLevel() {
+      return currentZoomLevel;
+    }
+    
+    // Allow Python to get visible price range
+    function getVisiblePriceRange() {
+      if (!chart) return { top: 0, bottom: 0 };
+      const bounding = chart.getConvertPictureCorner();
+      return bounding || { top: 0, bottom: 0 };
     }
   </script>
 </body>
