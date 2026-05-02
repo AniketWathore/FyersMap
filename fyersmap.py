@@ -53,10 +53,10 @@ log = logging.getLogger('bookmap')
 #  FILE PATHS  ← adjust if moved
 # ─────────────────────────────────────────────────────────────
 TICK_FILE = (
-    "/home/aniket/SMP DATA/MarketDepthData/2026-02-27_12-15-23_NSE_TCS-EQ/NSE_TCS-EQ/NSE_TCS-EQ_tick_20260227_121523.csv"
+    "/Users/prashik/Aniket/SMP/DATA/MarketDepthData/2026-04-02_09-51-52_NSE_TCS-EQ/NSE_TCS-EQ/NSE_TCS-EQ_tick_20260402_095152_ticks.csv"
 )
 ORDERBOOK_FILE = (
-    "/home/aniket/SMP DATA/MarketDepthData/2026-02-27_12-15-23_NSE_TCS-EQ/NSE_TCS-EQ/NSE_TCS-EQ_orderbook_20260227_121523.csv"
+    "/Users/prashik/Aniket/SMP/DATA/MarketDepthData/2026-04-02_09-51-52_NSE_TCS-EQ/NSE_TCS-EQ/NSE_TCS-EQ_orderbook_20260402_095152.csv"
 )
 
 # ─────────────────────────────────────────────────────────────
