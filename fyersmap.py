@@ -32,7 +32,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QFrame, QSplitter, QComboBox, QStatusBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QStyledItemDelegate,
+    QStyledItemDelegate, QSizePolicy,
 )
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtCore import Qt, QThread, QTimer, QSize, QRect, QUrl, pyqtSignal
@@ -382,9 +382,9 @@ class OrderbookWidget(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet(f"QFrame {{ background:{C_BG}; }}")
-        self.setMinimumWidth(400)
-        self.setMaximumWidth(700)
-
+        self.setMinimumWidth(300)
+        # Don't set maximum width - let it scale with window
+        
         self._sorted_prices: List[float] = []
         self._n              = 0
         self._mid_idx        = -1
@@ -681,11 +681,15 @@ class TradingChart(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet(f"QWidget {{ background:{C_BG}; }}")
+        # Allow widget to expand to fill available space
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         
         self.view = QWebEngineView(self)
+        self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         
         # Load local HTML
         html_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'web', 'chart.html'))
@@ -711,6 +715,23 @@ class TradingChart(QWidget):
         Just doing nothing here since we removed the forced manual sync.
         """
         pass
+
+    def resizeEvent(self, event):
+        """Handle resize events to properly resize the chart."""
+        super().resizeEvent(event)
+        # Trigger chart resize to fill available space
+        self.view.page().runJavaScript("""
+            if (chart) {
+                try {
+                    const container = document.getElementById('chart');
+                    if (container) {
+                        chart.resize();
+                    }
+                } catch(e) {
+                    console.log('Chart resize error:', e);
+                }
+            }
+        """)
 
     def on_tick(self, mid: float, tick_num: int, timestamp: int):
         js = f"updateTick({timestamp}, {mid});"
@@ -885,7 +906,9 @@ class BookmapTerminal(QMainWindow):
 
         spl.addWidget(self.dom)
         spl.addWidget(self.chart)
-        spl.setSizes([430, 1170])
+        # Use stretch factors instead of fixed sizes for proper fullscreen scaling
+        spl.setStretchFactor(0, 1)  # DOM takes 1 part
+        spl.setStretchFactor(1, 2)  # Chart takes 2 parts (wider)
         spl.setCollapsible(0, False)
         spl.setCollapsible(1, False)
         lay.addWidget(spl, stretch=1)

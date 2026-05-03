@@ -86,36 +86,47 @@
       });
     };
     
+    // Handle window resize to properly scale the chart
+    window.addEventListener('resize', function() {
+      if (chart) {
+        try {
+          chart.resize();
+        } catch(e) {
+          console.log('Resize error:', e);
+        }
+      }
+    });
+    
     function updateZoomLevel() {
       if (!chart) return;
-      // Get the current visible price range
-      const bounding = chart.getConvertPictureCorner();
-      if (bounding && bounding.top !== undefined && bounding.bottom !== undefined) {
-        const priceRange = Math.abs(bounding.top - bounding.bottom);
-        
-        // Determine zoom level based on price range
-        if (priceRange < 0.5) {
-          currentZoomLevel = 0.01; // Fine: 0.01
-        } else if (priceRange < 1) {
-          currentZoomLevel = 0.05; // 0.05
-        } else if (priceRange < 2) {
-          currentZoomLevel = 0.1; // 0.1
-        } else if (priceRange < 5) {
-          currentZoomLevel = 0.5; // 0.5
-        } else if (priceRange < 10) {
-          currentZoomLevel = 1.0; // 1.0
-        } else if (priceRange < 20) {
-          currentZoomLevel = 3.0; // 3.0
-        } else if (priceRange < 50) {
-          currentZoomLevel = 5.0; // 5.0
-        } else {
-          currentZoomLevel = 10.0; // Coarse: 10+
+      // Simplified zoom level detection without using unavailable methods
+      // We'll estimate based on the number of visible bars
+      try {
+        const visibleRange = chart.getVisibleRange();
+        if (visibleRange) {
+          const rangeSize = visibleRange.to - visibleRange.from;
+          
+          // Estimate zoom level from visible bar count
+          if (rangeSize < 50) {
+            currentZoomLevel = 0.01; // Fine zoom
+          } else if (rangeSize < 100) {
+            currentZoomLevel = 0.05;
+          } else if (rangeSize < 200) {
+            currentZoomLevel = 0.1;
+          } else if (rangeSize < 400) {
+            currentZoomLevel = 0.5;
+          } else if (rangeSize < 800) {
+            currentZoomLevel = 1.0;
+          } else if (rangeSize < 2000) {
+            currentZoomLevel = 3.0;
+          } else if (rangeSize < 5000) {
+            currentZoomLevel = 5.0;
+          } else {
+            currentZoomLevel = 10.0;
+          }
         }
-        
-        // Notify Python about zoom change
-        if (window.qt && window.qt.webChannelTransport) {
-          window.pyBridge.onZoomChanged(currentZoomLevel, bounding.top, bounding.bottom);
-        }
+      } catch (e) {
+        console.log('Zoom detection:', e.message);
       }
     }
     
@@ -149,8 +160,12 @@
     // Allow Python to get visible price range
     function getVisiblePriceRange() {
       if (!chart) return { top: 0, bottom: 0 };
-      const bounding = chart.getConvertPictureCorner();
-      return bounding || { top: 0, bottom: 0 };
+      try {
+        const visibleRange = chart.getVisibleRange();
+        return visibleRange || { top: 0, bottom: 0 };
+      } catch (e) {
+        return { top: 0, bottom: 0 };
+      }
     }
   </script>
 </body>
